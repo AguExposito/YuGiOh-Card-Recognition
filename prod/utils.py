@@ -195,8 +195,9 @@ class CardEmbeddingManager:
             return results
 
 def preprocess_real_photo(image_path: str) -> Optional[Image.Image]:
-    """Preprocesar foto real para extraer la carta usando OpenCV"""
+    """Preprocesar foto real para extraer la carta usando OpenCV y warpear a 624x624"""
     try:
+        TARGET_SIZE = (624, 624)
         # Cargar imagen
         image = cv2.imread(image_path)
         if image is None:
@@ -205,144 +206,102 @@ def preprocess_real_photo(image_path: str) -> Optional[Image.Image]:
         
         # Convertir a RGB
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # Convertir a escala de grises
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Aplicar blur para reducir ruido
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Detección de bordes con Canny (más sensible)
         edges = cv2.Canny(blurred, 30, 100)
-        
-        # Encontrar contornos
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Filtrar contornos por área y forma
         card_contour = None
-        max_score = 0
-        
+        max_area = 0
+        best_quad = None
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area > 5000:  # Filtrar contornos muy pequeños
-                # Aproximar el contorno a un polígono
+            if area > 5000:
                 epsilon = 0.02 * cv2.arcLength(contour, True)
                 approx = cv2.approxPolyDP(contour, epsilon, True)
-                
-                # Calcular score basado en forma y área
-                score = 0
-                
-                # Preferir contornos con 4 vértices (rectángulos)
-                if len(approx) == 4:
-                    score += 100
-                elif len(approx) >= 4 and len(approx) <= 8:
-                    score += 50
-                
-                # Preferir contornos más grandes
-                score += area / 1000
-                
-                # Preferir contornos con relación de aspecto similar a cartas (1.4:1)
-                x, y, w, h = cv2.boundingRect(contour)
-                aspect_ratio = w / h if h > 0 else 0
-                if 1.2 <= aspect_ratio <= 1.6:  # Rango típico de cartas
-                    score += 50
-                
-                # Preferir contornos que ocupen una parte razonable de la imagen
-                image_area = image.shape[0] * image.shape[1]
-                area_ratio = area / image_area
-                if 0.1 <= area_ratio <= 0.8:  # Entre 10% y 80% de la imagen
-                    score += 30
-                
-                if score > max_score:
-                    max_score = score
-                    card_contour = approx
-        
-        if card_contour is not None and max_score > 100:
-            # Extraer la región de la carta
-            x, y, w, h = cv2.boundingRect(card_contour)
-            
-            # Añadir margen
-            margin = 20
-            x = max(0, x - margin)
-            y = max(0, y - margin)
-            w = min(image.shape[1] - x, w + 2 * margin)
-            h = min(image.shape[0] - y, h + 2 * margin)
-            
-            # Recortar la carta
-            card_image = image_rgb[y:y+h, x:x+w]
-            
-            # Convertir a PIL Image
-            pil_image = Image.fromarray(card_image)
-            logger.info(f"Carta extraída exitosamente: {pil_image.size}, score: {max_score:.1f}")
+                if len(approx) == 4 and area > max_area:
+                    max_area = area
+                    best_quad = approx
+        if best_quad is not None:
+            # Ordenar los puntos del cuadrilátero
+            pts = best_quad.reshape(4, 2)
+            rect = np.zeros((4, 2), dtype="float32")
+            s = pts.sum(axis=1)
+            rect[0] = pts[np.argmin(s)]  # top-left
+            rect[2] = pts[np.argmax(s)]  # bottom-right
+            diff = np.diff(pts, axis=1)
+            rect[1] = pts[np.argmin(diff)]  # top-right
+            rect[3] = pts[np.argmax(diff)]  # bottom-left
+            dst = np.array([
+                [0, 0],
+                [TARGET_SIZE[0] - 1, 0],
+                [TARGET_SIZE[0] - 1, TARGET_SIZE[1] - 1],
+                [0, TARGET_SIZE[1] - 1]
+            ], dtype="float32")
+            M = cv2.getPerspectiveTransform(rect, dst)
+            warped = cv2.warpPerspective(image_rgb, M, TARGET_SIZE)
+            pil_image = Image.fromarray(warped)
+            logger.info(f"Carta warpeada exitosamente a {TARGET_SIZE}")
             return pil_image
         else:
-            logger.warning(f"No se encontró contorno de carta válido (mejor score: {max_score:.1f})")
-            # Intentar detección por color como fallback
-            logger.info("Intentando detección por color...")
-            return _detect_card_by_color(image_rgb)
-            
+            # Si no hay cuadrilátero, usar bounding box más grande
+            if contours:
+                largest = max(contours, key=cv2.contourArea)
+                x, y, w, h = cv2.boundingRect(largest)
+                if w > 50 and h > 50:
+                    margin = 20
+                    x = max(0, x - margin)
+                    y = max(0, y - margin)
+                    w = min(image_rgb.shape[1] - x, w + 2 * margin)
+                    h = min(image_rgb.shape[0] - y, h + 2 * margin)
+                    crop = image_rgb[y:y+h, x:x+w]
+                    resized = cv2.resize(crop, TARGET_SIZE)
+                    pil_image = Image.fromarray(resized)
+                    logger.info(f"Carta recortada por bounding box y estirada a {TARGET_SIZE}")
+                    return pil_image
+            # Fallback: detección por color
+            logger.warning("No se encontró cuadrilátero, usando fallback por color o imagen original")
+            return _detect_card_by_color_and_resize(image_rgb, TARGET_SIZE)
     except Exception as e:
         logger.error(f"Error en preprocesamiento: {e}")
         return None
 
-def _detect_card_by_color(image_rgb: np.ndarray) -> Image.Image:
-    """Detección alternativa de carta por color (fallback)"""
+def _detect_card_by_color_and_resize(image_rgb: np.ndarray, target_size=(624, 624)) -> Image.Image:
+    """Fallback: detección por color y resize a target_size"""
     try:
-        # Convertir a HSV para mejor detección de colores
         hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
-        
-        # Detectar colores típicos de cartas (amarillo, dorado, etc.)
-        # Rango para amarillo/dorado
         lower_yellow = np.array([15, 50, 50])
         upper_yellow = np.array([35, 255, 255])
-        
-        # Rango para blanco
         lower_white = np.array([0, 0, 200])
         upper_white = np.array([180, 30, 255])
-        
-        # Crear máscaras
         mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
         mask_white = cv2.inRange(hsv, lower_white, upper_white)
-        
-        # Combinar máscaras
         mask = cv2.bitwise_or(mask_yellow, mask_white)
-        
-        # Aplicar operaciones morfológicas para limpiar
         kernel = np.ones((5,5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        
-        # Encontrar contornos en la máscara
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
         if contours:
-            # Encontrar el contorno más grande
-            largest_contour = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest_contour)
-            
+            largest = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(largest)
             if area > 1000:
-                x, y, w, h = cv2.boundingRect(largest_contour)
-                
-                # Añadir margen
+                x, y, w, h = cv2.boundingRect(largest)
                 margin = 30
                 x = max(0, x - margin)
                 y = max(0, y - margin)
                 w = min(image_rgb.shape[1] - x, w + 2 * margin)
                 h = min(image_rgb.shape[0] - y, h + 2 * margin)
-                
-                # Recortar la carta
-                card_image = image_rgb[y:y+h, x:x+w]
-                pil_image = Image.fromarray(card_image)
-                logger.info(f"Carta detectada por color: {pil_image.size}")
+                crop = image_rgb[y:y+h, x:x+w]
+                resized = cv2.resize(crop, target_size)
+                pil_image = Image.fromarray(resized)
+                logger.info(f"Carta detectada por color y estirada a {target_size}")
                 return pil_image
-        
-        # Si no se encuentra nada, retornar la imagen original
         logger.warning("No se pudo detectar carta por color, usando imagen original")
-        return Image.fromarray(image_rgb)
-        
+        resized = cv2.resize(image_rgb, target_size)
+        return Image.fromarray(resized)
     except Exception as e:
         logger.error(f"Error en detección por color: {e}")
-        return Image.fromarray(image_rgb)
+        resized = cv2.resize(image_rgb, target_size)
+        return Image.fromarray(resized)
 
 def load_image_from_path(image_path: str) -> Optional[Image.Image]:
     """Cargar imagen desde path"""
